@@ -8,6 +8,12 @@ const { CookieJar } = require('tough-cookie');
 const app = express();
 
 // ==========================================
+// 0. SISTEM CACHE (IN-MEMORY)
+// ==========================================
+const streamCache = new Map();
+const CACHE_TTL = 30 * 60 * 1000; // Cache hasil grabber selama 30 Menit
+
+// ==========================================
 // 1. DEKRIPSI URL & HELPER
 // ==========================================
 
@@ -128,29 +134,55 @@ app.get('/', async (req, res) => {
     let errorMsg = "";
 
     if (target) {
-        if (target.includes('streampoi') || target.includes('streamruby')) {
-            const direct = await getStreampoiStream(target);
-            if (direct) {
-                videoSrc = `/relay?url=${encodeURIComponent(direct)}&ref=https://streampoi.com/&ori=https://streampoi.com`;
-                streamType = "application/x-mpegURL";
+        // --- CEK CACHE SEBELUM SCRAPING ---
+        if (streamCache.has(target)) {
+            const cachedData = streamCache.get(target);
+            if (Date.now() < cachedData.expireAt) {
+                videoSrc = cachedData.videoSrc;
+                streamType = cachedData.streamType;
+                console.log(`[CACHE HIT] Menggunakan cache untuk: ${target}`);
+            } else {
+                streamCache.delete(target); // Hapus jika sudah expired
+                console.log(`[CACHE EXPIRED] Menghapus cache lama untuk: ${target}`);
             }
-        } else if (target.includes('dood') || target.includes('myvidplay')) {
-            const direct = await getDoodstreamStream(target);
-            if (direct) {
-                videoSrc = `/relay?url=${encodeURIComponent(direct)}&ref=https://dood.to/&ori=https://dood.to`;
-                streamType = "video/mp4";
-            }
-        } else if (target.includes('vidnest')) {
-            const direct = await getVidnestStream(target);
-            if (direct) {
-                videoSrc = `/relay?url=${encodeURIComponent(direct)}&ref=https://vidnest.io/&ori=https://vidnest.io`;
-                streamType = direct.includes('.m3u8') ? "application/x-mpegURL" : "video/mp4";
-            }
-        } else {
-            errorMsg = "Silahkan gunakan Server Lainya";
         }
 
-        if (!videoSrc) errorMsg = "Gagal mengambil video. Refresh halaman.";
+        // --- LAKUKAN SCRAPING JIKA TIDAK ADA DI CACHE ---
+        if (!videoSrc) {
+            console.log(`[SCRAPING] Mengambil stream baru untuk: ${target}`);
+            if (target.includes('streampoi') || target.includes('streamruby')) {
+                const direct = await getStreampoiStream(target);
+                if (direct) {
+                    videoSrc = `/relay?url=${encodeURIComponent(direct)}&ref=https://streampoi.com/&ori=https://streampoi.com`;
+                    streamType = "application/x-mpegURL";
+                }
+            } else if (target.includes('dood') || target.includes('myvidplay')) {
+                const direct = await getDoodstreamStream(target);
+                if (direct) {
+                    videoSrc = `/relay?url=${encodeURIComponent(direct)}&ref=https://dood.to/&ori=https://dood.to`;
+                    streamType = "video/mp4";
+                }
+            } else if (target.includes('vidnest')) {
+                const direct = await getVidnestStream(target);
+                if (direct) {
+                    videoSrc = `/relay?url=${encodeURIComponent(direct)}&ref=https://vidnest.io/&ori=https://vidnest.io`;
+                    streamType = direct.includes('.m3u8') ? "application/x-mpegURL" : "video/mp4";
+                }
+            } else {
+                errorMsg = "Silahkan gunakan Server Lainya";
+            }
+
+            // --- SIMPAN KE CACHE JIKA BERHASIL ---
+            if (videoSrc) {
+                streamCache.set(target, {
+                    videoSrc,
+                    streamType,
+                    expireAt: Date.now() + CACHE_TTL
+                });
+            } else {
+                errorMsg = "Gagal mengambil video. Refresh halaman.";
+            }
+        }
     }
 
     const html = `
@@ -207,7 +239,6 @@ app.get('/', async (req, res) => {
                     let hlsConfig = {};
                     let engine;
                     
-                    // Inisialisasi P2P Engine jika didukung oleh browser
                     if (typeof p2pml !== "undefined" && p2pml.hlsjs.Engine.isSupported()) {
                         engine = new p2pml.hlsjs.Engine({
                             loader: {
@@ -221,17 +252,14 @@ app.get('/', async (req, res) => {
                             }
                         });
                         
-                        // Masukkan loader P2P ke dalam konfigurasi HLS
                         hlsConfig = {
                             liveSyncDurationCount: 7,
                             loader: engine.createLoaderClass()
                         };
                     }
 
-                    // Buat instance Hls dengan config (P2P terpasang jika ada)
                     const hls = new Hls(hlsConfig);
                     
-                    // Hubungkan P2P Engine dengan Hls instance
                     if (engine) {
                         p2pml.hlsjs.initHlsJsPlayer(hls);
                     }
@@ -243,7 +271,6 @@ app.get('/', async (req, res) => {
                     });
 
                 } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-                    // Fallback untuk Safari (Native HLS, P2P tidak berjalan di mode ini)
                     video.src = source;
                     new Plyr(video, defaultOptions);
                 }
@@ -261,7 +288,7 @@ app.get('/', async (req, res) => {
     res.send(html);
 });
 
-// B. Route Relay Stream (Bypass Dinamis HLS & Header)
+// B. Route Relay Stream (Bypass Dinamis HLS & Header + Edge Caching)
 app.get('/relay', async (req, res) => {
     let url = req.query.url;
     let refererHeader = req.query.ref || ""; 
@@ -285,8 +312,12 @@ app.get('/relay', async (req, res) => {
             headers: headers
         });
 
+        // --- TAMBAHKAN CACHE CONTROL UNTUK VERCEL EDGE NETWORK ---
         if (isM3U8) {
+            // Playlist .m3u8 dicache sebentar saja (1 menit) karena isinya bisa berubah/expired
+            res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate');
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+            
             const baseUrl = url.substring(0, url.lastIndexOf('/') + 1);
             
             const modifiedM3u8 = response.data.replace(/^(?!#)(.+)$/gm, (match, line) => {
@@ -299,6 +330,9 @@ app.get('/relay', async (req, res) => {
             
             res.send(modifiedM3u8);
         } else {
+            // Potongan video .ts / .mp4 dicache lama (1 hari) karena isinya statis
+            res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate');
+            
             if (response.headers['content-type']) res.setHeader('Content-Type', response.headers['content-type']);
             if (response.headers['content-length']) res.setHeader('Content-Length', response.headers['content-length']);
             
